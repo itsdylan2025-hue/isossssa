@@ -46,8 +46,8 @@ jobs:
                   applicationId = "com.example.overlay"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -90,16 +90,21 @@ jobs:
           import android.app.*
           import android.content.Context
           import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
           import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
           import android.os.IBinder
           import android.view.Gravity
           import android.view.WindowManager
           import android.widget.ImageView
+          import android.widget.Toast
 
           class OverlayService : Service() {
               private lateinit var wm: WindowManager
               private var view: ImageView? = null
-              private lateinit var lp: WindowManager.LayoutParams
+              private var lp: WindowManager.LayoutParams? = null
 
               override fun onBind(intent: Intent?): IBinder? = null
 
@@ -119,7 +124,11 @@ jobs:
                       .setContentText("Tap to adjust")
                       .setContentIntent(pi)
                       .build()
-                  startForeground(1, n)
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -127,21 +136,25 @@ jobs:
                       stopSelf()
                       return START_NOT_STICKY
                   }
-                  if (view == null) addOverlay()
-                  applyPrefs()
+                  try {
+                      if (view == null) addOverlay()
+                      applyPrefs()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Overlay error: " + e.message, Toast.LENGTH_LONG).show()
+                  }
                   return START_STICKY
               }
 
               private fun addOverlay() {
                   view = ImageView(this).apply {
                       setImageResource(R.drawable.overlay_image)
-                      scaleType = ImageView.ScaleType.FIT_XY // lets width and height stretch independently
+                      scaleType = ImageView.ScaleType.FIT_XY
                   }
                   lp = WindowManager.LayoutParams(
-                      100, 100,
+                      300, 100,
                       WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or // touches pass through
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                           WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                           WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                       PixelFormat.TRANSLUCENT
@@ -150,20 +163,28 @@ jobs:
               }
 
               private fun applyPrefs() {
+                  val v = view ?: return
+                  val l = lp ?: return
                   val p = getSharedPreferences("overlay", Context.MODE_PRIVATE)
                   val dm = resources.displayMetrics
                   val w = (p.getInt("w", 160) * dm.density).toInt()
                   val h = (p.getInt("h", 50) * dm.density).toInt()
-                  lp.width = w
-                  lp.height = h
-                  // X/Y sliders (0-100%) position the image's CENTER on the screen
-                  lp.x = (p.getInt("x", 50) / 100f * dm.widthPixels - w / 2f).toInt()
-                  lp.y = (p.getInt("y", 50) / 100f * dm.heightPixels - h / 2f).toInt()
-                  view?.let { wm.updateViewLayout(it, lp) }
+                  l.width = w
+                  l.height = h
+                  // X/Y sliders (0-100.0%) position the image's CENTER on the screen
+                  l.x = (p.getInt("x2", 500) / 1000f * dm.widthPixels - w / 2f).toInt()
+                  l.y = (p.getInt("y2", 500) / 1000f * dm.heightPixels - h / 2f).toInt()
+                  v.background = if (p.getBoolean("outline", false)) {
+                      GradientDrawable().apply {
+                          setColor(Color.argb(70, 255, 0, 0))
+                          setStroke((3 * dm.density).toInt(), Color.RED)
+                      }
+                  } else null
+                  wm.updateViewLayout(v, l)
               }
 
               override fun onDestroy() {
-                  view?.let { wm.removeView(it) }
+                  view?.let { try { wm.removeView(it) } catch (e: Exception) {} }
                   view = null
                   super.onDestroy()
               }
@@ -183,11 +204,28 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
-          import android.view.View
           import android.widget.*
 
           class MainActivity : Activity() {
               private val prefs by lazy { getSharedPreferences("overlay", Context.MODE_PRIVATE) }
+              private lateinit var status: TextView
+
+              private fun refresh() {
+                  if (prefs.getBoolean("running", false)) {
+                      startService(Intent(this, OverlayService::class.java))
+                  }
+              }
+
+              private fun updateStatus() {
+                  val perm = if (Settings.canDrawOverlays(this)) "ON" else "OFF (tap Start to fix)"
+                  val run = if (prefs.getBoolean("running", false)) "running" else "stopped"
+                  status.text = "Overlay permission: $perm\nOverlay: $run"
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  updateStatus()
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -197,30 +235,50 @@ jobs:
                       setPadding(pad, pad * 2, pad, pad)
                   }
 
+                  status = TextView(this)
+                  root.addView(status)
+
                   val toggle = Button(this).apply { text = "Start overlay" }
                   val stop = Button(this).apply { text = "Stop overlay" }
                   root.addView(toggle)
                   root.addView(stop)
 
-                  addSlider(root, "Position X (left - right)", "x", 50, 100)
-                  addSlider(root, "Position Y (up - down)", "y", 50, 100)
-                  addSlider(root, "Width", "w", 160, 1200)
-                  addSlider(root, "Height", "h", 50, 1200)
+                  val outline = CheckBox(this).apply {
+                      text = "Show red outline (to test visibility)"
+                      isChecked = prefs.getBoolean("outline", false)
+                      setOnCheckedChangeListener { _, c ->
+                          prefs.edit().putBoolean("outline", c).apply()
+                          refresh()
+                      }
+                  }
+                  root.addView(outline)
+
+                  addSlider(root, "Position X (left - right)", "x2", 500, 1000, 10f)
+                  addSlider(root, "Position Y (up - down)", "y2", 500, 1000, 10f)
+                  addSlider(root, "Width", "w", 160, 1500, 1f)
+                  addSlider(root, "Height", "h", 50, 1500, 1f)
 
                   toggle.setOnClickListener {
                       if (!Settings.canDrawOverlays(this)) {
                           startActivity(
                               Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
                           )
-                          Toast.makeText(this, "Allow 'Display over other apps', then press Start again", Toast.LENGTH_LONG).show()
+                          Toast.makeText(this, "Turn ON 'Allow display over other apps', then come back and press Start", Toast.LENGTH_LONG).show()
                       } else {
-                          prefs.edit().putBoolean("running", true).apply()
-                          startForegroundService(Intent(this, OverlayService::class.java))
+                          try {
+                              prefs.edit().putBoolean("running", true).apply()
+                              startForegroundService(Intent(this, OverlayService::class.java))
+                              Toast.makeText(this, "Overlay started", Toast.LENGTH_SHORT).show()
+                          } catch (e: Exception) {
+                              Toast.makeText(this, "Could not start: " + e.message, Toast.LENGTH_LONG).show()
+                          }
+                          updateStatus()
                       }
                   }
                   stop.setOnClickListener {
                       prefs.edit().putBoolean("running", false).apply()
                       startService(Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_STOP))
+                      updateStatus()
                   }
 
                   setContentView(ScrollView(this).apply { addView(root) })
@@ -230,20 +288,18 @@ jobs:
                   ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
               }
 
-              private fun addSlider(root: LinearLayout, title: String, key: String, def: Int, max: Int) {
+              private fun addSlider(root: LinearLayout, title: String, key: String, def: Int, max: Int, div: Float) {
                   val value = prefs.getInt(key, def)
-                  val label = TextView(this).apply { text = "$title: $value"; setPadding(0, 40, 0, 0) }
+                  val label = TextView(this).apply { text = "$title: ${value / div}"; setPadding(0, 40, 0, 0) }
                   val bar = SeekBar(this).apply {
                       this.max = max
                       progress = value
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
                               val v = if (key == "w" || key == "h") p.coerceAtLeast(10) else p
-                              label.text = "$title: $v"
+                              label.text = "$title: ${v / div}"
                               prefs.edit().putInt(key, v).apply()
-                              if (prefs.getBoolean("running", false)) {
-                                  startService(Intent(this@MainActivity, OverlayService::class.java))
-                              }
+                              refresh()
                           }
                           override fun onStartTrackingTouch(s: SeekBar) {}
                           override fun onStopTrackingTouch(s: SeekBar) {}
